@@ -1,41 +1,29 @@
-import { assign, createActor, setup } from "xstate";
+import { assign, createActor, setup, and, or, not} from "xstate";
 import { speechstate } from "speechstate";
 import { createBrowserInspector } from "@statelyai/inspect";
 import { KEY, NLU_KEY } from "./azure.js";
 
 /*Note on lab5:
+Note on resubmission of lab 5:
+I have fixed the issues that arrose when there are no entities. In conjunction, I added proper higher level guards instead
+of the pure javascript combination guards I had before.
 
-Justifications for confidence threshholds:
-I put the ASR threshhold lower than the NLU one for two reasons. First, the NLU is what is actually used to fetch
-the values that are stored in the context, which are then used to "book" the meeting. Of course, if the system is overly
-confident of its NLU BECAUSE it was based on faulty ASR, this would still be a problem, but this did not happen that much in
-my experience. Second, there were times the system did not meet the ASR while it met the NLU threshhold while I also during
-testing logged both, and I could see that while the ASR was slightly off, the NLU would have been fine due to my entities
-catching what was needed. As a user, I would then ask to redo when it was not really necessary.
-The specific threshholds are somewhat arbitrary, but roughly speaking: when the system is right on the NLU, it is generally
-quite confidently right, so 0.7 seemed reasonable. 0.5 for ASR sprung from this value with the reasoning given above.
+After much scratching of my head, I think I also fixed the issue with the help state and the noUnderstanding state.
+(though I have not tested the fix in every state)
+They seemed identical to the noInput state in all ways that matter for the issue, so it was a bit confusing. 
 
-The code largely does what's requested. Of note: 1. There are a few bugs I couldn't iron out: in some cases when the input isn't clear, the
-the system goes idle, and I don't quite know why. 2. confirmationSpecifier() function was meant to be generally used, but I did not have
-time to make it properly format the utterances in the DecideIntents state. This should be easy enough to solve, but for now it does not
-use proper syntax. This is just an issue with the utterances: if it gets an affirmative response, it manages to go ahead to whatever
-is supposed to be the next step. 3. Due to time constraints, the code is far from as general as I'd like it to be. There are some 
-generalising features (function, parent state event checkers), but far from enough. Most notably, there are a lot of reused guards.
+The states themselves seem to have been fine; the problem is what seems like an inconsistency between how the asr_noinput
+and the recognised events relate to a history state if that history state is on the same level as the event.
+The problem wasn't that help/noUnderstanding crashed, but rather that they for some reason sent to the state before the previous
+state, rather than just to the previous state. So if entered mid-dialogue, they would send back to a stage of the meeting booking
+that had already been stored, and if entered at the beginning of the dialogue, they would send back to WaitToStart. So the system 
+is idle not because of a crash, but because WaitToStart is an idle state. I don't know if there is a purpose to this since on the xstate
+level, noinput and recognised are both just events that should behave the same. It seems more like an oversight.
+
+I fixed it (again, I think) by putting everything in my machine except the utility states into a parent state, and targetting a history
+state inside this parent state with my utility state transitions.
+
 */
-
-/* Note on lab4:
-The final clu model is much simpler than it initially was.
-I had trouble with too many entities of inconsistent categories, which got in the way of my dialogue management.
-For example, I wanted to make use of the built in ways of recognising time-utterances to get broader coverage,
-but doing this both for a "Day" and a "Time" entity makes both entities get recognised equally confidently in a state 
-where only one matters.
-
-There are also some general NLU issues, such as that "it will not" possibly being recognised as affirmative (since it contains
-"it will").
-
-Overall, the system could use some work, but at least it consistently manages to recognise which task is supposed to be performed
-based on intent (not always the proper entity), and it can book appointments with more variable inputs than before,
-if not quite as consistently.*/
 
 
 const inspector = createBrowserInspector();
@@ -119,6 +107,29 @@ const dmMachine = setup({
         type: "LISTEN",
       }),
   },
+  guards: {
+    nluConfidence: ({ event }) => event.nluValue.intents[0].confidenceScore >= 0.7,
+    asrConfidence: ({ event }) => event.value[0].confidence >= 0.5,
+    nluEntConf: ({ event }) =>  event.nluValue.entities[0].confidenceScore >= 0.7,
+    
+    createMeeting: ({ event }) => event.nluValue.topIntent === "create a meeting",
+    whoIsX: ({ event }) => event.nluValue.topIntent === "who is X",
+    confWhoIsX: ({ context }) => context.confirmationNLU.topIntent === "who is X",
+    confCreateMeeting: ({ context }) => context.confirmationNLU.topIntent === "create a meeting",
+    noEntities: ({ event }) => event.nluValue.entities.length < 1,
+    helpInt: ({ event }) => event.nluValue.topIntent === "help",
+    helpEnt: ({ event }) => event.nluValue.entities[0].category === "helpEnt",
+    helpAsr: ({ event }) => event.value[0].utterance === "Help",
+    inFamous: ({ event }) => event.nluValue.entities[0].text in famousPeopleDescriptions,
+    yes: ({ event }) => event.nluValue.entities[0].category === "affirmative",
+    no: ({ event }) => event.nluValue.entities[0].category === "negative",
+    nameEnt: ({ event }) => event.nluValue.entities[0].category === "name",
+    DayTimeEnt: ({ event }) => event.nluValue.entities[0].category === "DayAndTime",
+
+}, 
+
+
+
 }).createMachine({
   context: {
     reprompts: 0
@@ -134,9 +145,8 @@ const dmMachine = setup({
     // Help occurs if both intent[0] and entity[0] is "help", or if the entire utterance is "Help". When I only had the "help" intent,
     //I found that "help" was often (spuriously) the top intent in cases where the state only tries to find  entity information
     //I want the machine to focus on the proper entity in these cases. The current iteration tries to cast a wide but specific net
-    guard: ({ event }) => (event.nluValue.topIntent === "help" && event.nluValue.entities[0].category === "helpEnt") ||
-    (event.value[0].utterance === "Help"),
-    target: "#DM.Hist",                
+    guard: or([and(["helpInt", "helpEnt"]), "helpAsr" ]),
+    target: "#DM.HelpIntermediate",                
     actions:
     ({ context }) =>
     context.ssRef.send({
@@ -146,7 +156,7 @@ const dmMachine = setup({
       },
     }),
   },
-  {target: "#DM.TryAgainUnderstanding", actions: assign({reprompts: ({ context }) => context.reprompts +=1}),},],},
+{target: "#DM.TryAgainUnderstanding", actions: assign({reprompts: ({ context }) => context.reprompts +=1}),},],},
   states: {
     Prepare: {
       entry: [
@@ -159,11 +169,14 @@ const dmMachine = setup({
     },
     WaitToStart: {
       on: {
-        CLICK: "DecideIntent",
+        CLICK: "System.DecideIntent",
       },
-      after: {
+      /*after: {
         10000: "DecideIntent"
-      },
+      },*/
+    },
+    HelpIntermediate: {
+      on: { SPEAK_COMPLETE: "System.SystemHist",}
     },
 
     TryAgainNoInput: {
@@ -171,18 +184,15 @@ const dmMachine = setup({
       context.ssRef.send({
         type: "SPEAK",
         value: {
-          //modulo of reprompts gives an appropriate index for noInputPrompts
-          //context.reprompts is reset whenever the system moves forward, so the system
-          //does not remember the previous reprompt
           utterance: `${noInputPrompts[(context.reprompts)%3]}`,
 
         },
       }),
-      on: { SPEAK_COMPLETE: { guard: ({ context }) => context.reprompts < 3,
-      target: "Hist",},
+      on: { SPEAK_COMPLETE: [{ guard: ({ context }) => context.reprompts < 3,
+      target: "System.SystemHist",},
 
-      target: "Final",
-      actions: assign({reprompts: ({ }) => 0}),
+      {target: "Final",
+      actions: assign({reprompts: ({ }) => 0}),}]
      },
     },
     TryAgainUnderstanding: {
@@ -194,540 +204,540 @@ const dmMachine = setup({
           utterance: `${noUnderstanding[(context.reprompts)%3]}`,
         },
       }),
-      on: { SPEAK_COMPLETE: { guard: ({ context }) => context.reprompts < 3,
-      target: "Hist",},
-
-      target: "Final",
-      actions: assign({reprompts: ({ }) => 0}),
+      on: { SPEAK_COMPLETE: [{ guard: ({ context }) => context.reprompts < 3, target: "System.SystemHist",},
+      {target: "Final", actions: assign({reprompts: ({ }) => 0}),}]
      },
     },
   
-    Hist: {type: "history"},
-
-    DecideIntent: {
-      initial: "Prompting",
-      
-      states: {
-        Hist: {
-          type: "history",
-          entry: {target: "Prompting"}
-        },
-        Prompting:{
-          entry: 
-            {        
-            type: "speak",
-            params: `What can I help you with?`
-        },
-        
-          on:{
-            SPEAK_COMPLETE: "Listening"
-            },
-        },
-        Listening: {
-          entry: ({ context }) =>
-          context.ssRef.send({
-            type: "LISTEN",
-            value: { nlu: true },
-          }),
-
-          on: {
-            RECOGNISED:
-            [ 
-              { 
-                guard: ({ event }) => (event.nluValue.topIntent === "who is X" && event.value[0].confidence >= 0.5 &&
-                event.nluValue.intents[0].confidenceScore >= 0.7
-                && event.nluValue.entities.length > 0 && event.nluValue.entities[0].text in famousPeopleDescriptions),
-                target: "#DM.Final",                
-                actions:
-                ({ context, event }) =>
-                context.ssRef.send({
-                  type: "SPEAK",
-                  value: {
-                    utterance: `${famousPeopleDescriptions[event.nluValue.entities[0].text]}`,
-                  },
-                }),
-              },
-
-            {guard: ({ event }) => (event.nluValue.topIntent === "create a meeting" && event.value[0].confidence >= 0.5
-            && event.nluValue.intents[0].confidenceScore >= 0.7),
-              target: "#DM.InitialiseAppointment",
-              actions: assign({reprompts: ({ }) => 0}),
-            },
-            {
-              guard: ({ event }) => (event.nluValue.topIntent === "create a meeting" || 
-              (event.nluValue.topIntent === "who is X" && event.nluValue.entities.length > 0 &&
-               event.nluValue.entities[0].text in famousPeopleDescriptions)),
-              target: "Confirmation",
-              actions: [({ event }) => console.log(event.nluValue, event.value[0]),
-                assign({
-                confirmationNLU: ({ event }) => event.nluValue
-              }),
-              assign({
-                confirmationASR: ({ event }) => event.value[0]
-              }),],},
-
-           ],
-            },
-          },
-        Confirmation: {
-          //This confirmation state is a bit messier than the rest since there is more disambiguation required in DecideIntent
-          //than elsewhere
-          initial: "Confirming",
-          states: {
-          Confirming: {
-            always: [
-              { guard: ({ context }) => context.confirmationNLU.topIntent === "who is X",
-                    actions: [({ context }) => console.log(context.confirmationNLU, context.confirmationASR),
-                    ({ context }) => context.ssRef.send({
-                      type: "SPEAK",
-                      value: {
-                        utterance: `${confirmationSpecifier(context.confirmationNLU, context.confirmationASR,
-                          `do you want to know about who`, "intent")} ${context.confirmationNLU.entities[0].text}`,
-                      },}),],},
-                  { guard: ({ context }) => context.confirmationNLU.topIntent === "create a meeting",
-                    actions: [({ context }) => console.log(context.confirmationNLU, context.confirmationASR),
-                    ({ context }) => context.ssRef.send({
-                      type: "SPEAK",
-                      value: {
-                        utterance: `${confirmationSpecifier(context.confirmationNLU, context.confirmationASR,
-                          `do you want to`, "intent")}`,
-                      },}),],},],
-                on: { SPEAK_COMPLETE: "Resolving" },},
-      Resolving: {
-        entry: [
-          ({ context }) =>
-        context.ssRef.send({
-          type: "LISTEN",
-          value: { nlu: true },
-        }),],
-
-        on: {
-          RECOGNISED: 
-          [
-            { 
-              guard: ({ event, context}) => (context.confirmationNLU.topIntent === "who is X" && event.nluValue.entities.length > 0 && 
-              event.nluValue.entities[0].category === "affirmative"), /*||
-              (event.nluValue.topIntent === "who is X" && event.nluValue.entities[0].text in famousPeopleDescriptions)),*/
-              //commented code above was meant to allow for restatement, not just affirmation, but it did not work out.
-              target: "#DM.Final",
-              actions:[
-                ({ context }) =>
-                context.ssRef.send({
-                  type: "SPEAK",
-                  value: {
-                    utterance: `${famousPeopleDescriptions[context.confirmationNLU.entities[0].text]}`,
-                  },}),],},
-            {
-              guard: ({ event, context }) => (context.confirmationNLU.topIntent === "create a meeting" && 
-              event.nluValue.entities[0].category === "affirmative"), //|| event.nluValue.topIntent === "create a meeting"),
-              target: "#DM.InitialiseAppointment",
-              actions: [({ event }) => console.log(event.nluValue),
-              assign({reprompts: ({ }) => 0}),],
-            },
-            //I just go straight back to the initial prompt if the confirmation is not affirmed, regardless of whether this is due
-            //negative confirmation or some irrelevant entity being the top entity, and regardless of the confidence of the confirmation.
-            //Trying to confirm a confirmation and similar practices just seems more frustrating from a user perspective, so it seems
-            //reasonable to just make a call if the confirmation is not successful.
-            {target: "#DM.DecideIntent",}
-          ],
-        },
-      },
-    },
-  },
-},
-},
   
-    InitialiseAppointment: {
-      entry: {        
-          type: "speak",
-          params: `Let's book an appointment!`
-        },
-        on: {
-          SPEAK_COMPLETE: "MeetWho",
-          CLICK: "WaitToStart",
-        },
-    },
-
-    MeetWho: {
-      initial: "Prompting",
+    System: {
+      initial: "DecideIntents",
       states: {
-        Prompting:{
-          entry: {        
-            type: "speak",
-            params: `Who are you meeting with?`
-        },
-          on:{
-            SPEAK_COMPLETE: "Listening"
-            },
-        },
-        Listening: {
-          entry: ({ context }) =>
-          context.ssRef.send({
-            type: "LISTEN",
-            value: { nlu: true },
-          }),
-          on: {
-            RECOGNISED: [
-              {
-                guard: ({ event }) => (event.nluValue.entities.length > 0 && event.nluValue.entities[0].category === "name" && 
-                event.nluValue.entities[0].confidenceScore >= 0.7 && event.value[0].confidence >= 0.5 ),
-                target: "#DM.WhichDay",
-                actions: [assign({
-                  person: ({ event }) => event.nluValue.entities[0].text,
-                }),
-                assign({reprompts: ({ }) => 0}),],
-              },
-              {
-                guard: ({ event }) => (event.nluValue.entities.length > 0 && event.nluValue.entities[0].category  === "name"),
-                target: "Confirmation",
-                actions: [({ event }) => console.log(event.nluValue, event.value[0]),
-                  assign({
-                  confirmationNLU: ({ event }) => event.nluValue
-                }),
-                assign({
-                  confirmationASR: ({ event }) => event.value[0]
-                }),],},
-        
-            ],
-            },
-          },
-        Confirmation: {
-          initial: "Confirming",
-          states: {
-            Confirming: {
-              always:              
-              {actions: [({ context }) => console.log(context.confirmationNLU, context.confirmationASR),
-              ({ context }) => context.ssRef.send({
-                type: "SPEAK",
-                value: {
-                  utterance: `${confirmationSpecifier(context.confirmationNLU, context.confirmationASR,
-                    `do you want to meet with`)}`,
-                },
-              }),
-            ],
-            },
+        SystemHist: {type: "history"},
+        DecideIntent: {
+          initial: "Prompting",
           
-          on: { SPEAK_COMPLETE: "Resolving" },
-        },
+          states: {
 
-        Resolving: {
-          entry: 
-            ({ context }) =>
-          context.ssRef.send({
-            type: "LISTEN",
-            value: { nlu: true },
-          }),
-          on: {
-            RECOGNISED: 
-            [
-              { 
-                guard: ({ event }) => (event.nluValue.entities.length > 0 && event.nluValue.entities[0].category === "affirmative"),
-                target: "#DM.WhichDay",
-                actions: [assign({
-                  person: ({ context }) => context.confirmationNLU.entities[0].text,
-                }),
-                assign({reprompts: ({ }) => 0}),],       
-              },
-              {target: "#DM.MeetWho"}
-            ],
-          },
-        },
-      },
-    },
-    
-  },
-},
-
-    WhichDay: {
-      initial: "Prompting",
-      states: {
-        Prompting:{
-          entry: {        
-            type: "speak",
-            params: `On which day is your meeting?`
-        },
-          on:{
-            SPEAK_COMPLETE: "Listening"
-            },
-        },
-        Listening: {
-          entry: ({ context }) =>
-          context.ssRef.send({
-            type: "LISTEN",
-            value: { nlu: true },
-          }),
-
-          on: {
-            RECOGNISED: [
-              {
-                guard: ({ event }) => (event.nluValue.entities.length > 0 && event.nluValue.entities[0].category === "DayAndTime" && 
-                event.nluValue.entities[0].confidenceScore >= 0.7 && event.value[0].confidence >= 0.5 ),
-                target: "#DM.WholeDay",
-                actions: [assign({
-                  day: ({ event }) => event.nluValue.entities[0].text,
-                }),
-                assign({reprompts: ({ }) => 0}),],
-              },
-              {
-                guard: ({ event }) => (event.nluValue.entities.length > 0 && event.nluValue.entities[0].category  === "DayAndTime"),
-                target: "Confirmation",
-                actions: [({ event }) => console.log(event.nluValue, event.value[0]),
-                  assign({
-                  confirmationNLU: ({ event }) => event.nluValue
-                }),
-                assign({
-                  confirmationASR: ({ event }) => event.value[0]
-                }),],},      
-            ],
-            },
-          },
-          Confirmation: {
-            initial: "Confirming",
-            states: {
-              Confirming: {
-                always:              
-                {actions: [({ context }) => console.log(context.confirmationNLU, context.confirmationASR),
-                ({ context }) => context.ssRef.send({
-                  type: "SPEAK",
-                  value: {
-                    utterance: `${confirmationSpecifier(context.confirmationNLU, context.confirmationASR,
-                      `will the meeting day be`)}`,
-                  },
-                }),
-              ],
-              },
-            on: { SPEAK_COMPLETE: "Resolving" },
-          },
-          Resolving: {
-            entry: 
-              ({ context }) =>
-            context.ssRef.send({
-              type: "LISTEN",
-              value: { nlu: true },
-            }),
-            on: {
-              RECOGNISED: 
-              [
-                { 
-                  guard: ({ event }) => (event.nluValue.entities.length > 0 && event.nluValue.entities[0].category === "affirmative"),
-                  target: "#DM.WholeDay",
-                  actions: [assign({
-                    day: ({ context }) => context.confirmationNLU.entities[0].text,
-                  }),
-                  assign({reprompts: ({ }) => 0}),],         
-                },
-                {target: "#DM.WhichDay"}
-              ],
-            },
-          },
-        },
-      },
-      },
-    },
-
-    WholeDay: {
-      initial: "Prompting",
-      states: {
-        Prompting:{
-          entry: {        
-            type: "speak",
-            params: `Will it take the whole day?`
-        },
-          on:{
-            SPEAK_COMPLETE: "Listening"
-            },
-        },
-        Listening: {
-          entry: ({ context }) =>
-          context.ssRef.send({
-            type: "LISTEN",
-            value: { nlu: true },
-          }),
-
-          on: {
-            RECOGNISED: [
-              //I skip confirmation here and just send the user back to the beginning of the state if the newly added confidence threshhold 
-              //is not met. This is because the confirmation would just be another yes/no question, which this state already is. If the
-              //object is clarity, restating the question should make the user speak more clearly, and "Will it take the whole day?" should
-              // not be more of a strain to answer than "Did you say 'yes', and do you want to confirm that it will take the whole day?" 
-              //The confirmation seems more suited for nonbinary semantic content.
-              {
-                guard: ({ event }) => (event.nluValue.entities[0].confidenceScore < 0.7 || event.value[0].confidence < 0.5),
-                target: "#DM.WholeDay"
-              },
-              {
-                guard: ({ event }) => (event.nluValue.entities.length > 0 && event.nluValue.entities[0].category === "affirmative"),
-                target: "#DM.AppointmentCreation",
-                actions: 
-                  [assign({
-                  wholeday: "affirmative",
-                }),
-                assign({reprompts: ({ }) => 0}),],
-              },
-              {
-                guard: ({ event }) => (event.nluValue.entities.length > 0 && event.nluValue.entities[0].category === "negative"),
-                target: "#DM.TimeOfDay",
-                actions: assign({reprompts: ({ }) => 0}),
-
-              },
-            ],
-            },
-          },
-      },
-    },
-    
-    TimeOfDay: {
-      initial: "Prompting",
-      states: {
-        Prompting:{
-          entry: {        
-            type: "speak",
-            params: `What time is your meeting?`
-        },
-          on:{
-            SPEAK_COMPLETE: "Listening"
-            },
-        },
-        Listening: {
-          entry: ({ context }) =>
-          context.ssRef.send({
-            type: "LISTEN",
-            value: { nlu: true },
-          }),
-
-          on: {
-            RECOGNISED: [
-              {
-                guard: ({ event }) => (event.nluValue.entities.length > 0 && event.nluValue.entities[0].category === "DayAndTime" 
-                && event.nluValue.entities[0].confidenceScore >= 0.7 && event.value[0].confidence >= 0.5),
-                target: "#DM.AppointmentCreation",
-                actions: [assign({
-                  time: ({ event }) => event.nluValue.entities[0].text,
-                }),
-                assign({reprompts: ({ }) => 0}),],
-              },
-              {
-                guard: ({ event }) => (event.nluValue.entities.length > 0 && event.nluValue.entities[0].category === "DayAndTime"),
-                target: "Confirmation",
-                actions: [({ event }) => console.log(event.nluValue, event.value[0]),
-                  assign({
-                  confirmationNLU: ({ event }) => event.nluValue
-                }),
-                assign({
-                  confirmationASR: ({ event }) => event.value[0]
-                }),],},
-            ],
-            },
-          },
-          Confirmation: {
-            initial: "Confirming",
-            states: {
-              Confirming: {
-                always:              
-                {actions: [({ context }) => console.log(context.confirmationNLU, context.confirmationASR),
-                ({ context }) => context.ssRef.send({
-                  type: "SPEAK",
-                  value: {
-                    utterance: `${confirmationSpecifier(context.confirmationNLU, context.confirmationASR,
-                      `will the meeting time be`)}`,
-                  },
-                }),
-              ],
-            },
-            on: { SPEAK_COMPLETE: "Resolving" },
-          },
-          Resolving: {
-            entry: 
-              ({ context }) =>
-            context.ssRef.send({
-              type: "LISTEN",
-              value: { nlu: true },
-            }),
-            on: {
-              RECOGNISED: 
-              [
-                { 
-                  guard: ({ event }) => (event.nluValue.entities.length > 0 && event.nluValue.entities[0].category === "affirmative"),
-                  target: "#DM.AppointmentCreation",
-                  actions: [assign({
-                    time: ({ context }) => context.confirmationNLU.entities[0].text,
-                  }),
-                  assign({reprompts: ({ }) => 0}),],    
-                },
-                {target: "#DM.TimeOfDay"}
-              ],
-            },
-          },
-        },
-      },
-    },
-  },
-
-    AppointmentCreation: {
-      initial: "WholeDayDisambig",  
-      states: {
-        WholeDayDisambig: {
-          always: [{
-            guard: ({ context }) => context.wholeday === "affirmative",
-            target: "PromptingWholeDay",
-          },
-          {target: "PromptingPartialDay"},
-        ],
-        },
-        PromptingWholeDay:{
-          entry: ({ context }) =>
-            context.ssRef.send({
-              type: "SPEAK",
-              value: {
-                utterance: `Do you want me to create an appointment with ${context.person}. ${context.day}
-                for the whole day?`,
-              },
-            }),
-          on: { SPEAK_COMPLETE: "Listening" },
-        },
-        PromptingPartialDay: {
-          entry: ({ context }) =>
-            context.ssRef.send({
-              type: "SPEAK",
-              value: {
-                utterance: `Do you want me to create an appointment with ${context.person}. ${context.day}.
-                ${context.time}?`,
-              },
-            }),
-          on: { SPEAK_COMPLETE: "Listening" },
-        },
-        Listening: {
-          entry: ({ context }) =>
-          context.ssRef.send({
-            type: "LISTEN",
-            value: { nlu: true },
-          }),
-          on: {
-            RECOGNISED: [
-               {
-                guard: ({ event }) => (event.nluValue.entities.length > 0 && event.nluValue.entities[0].category === "affirmative"),
-                target: "#DM.Final",
-              actions: {
+            Prompting:{
+              entry: 
+                {        
                 type: "speak",
-                params: `Your appointment has been created! Click again to book another one.`
-              },  
+                params: `What can I help you with?`
+            },
+            
+              on:{
+                SPEAK_COMPLETE: "Listening"
+                },
+            },
+            Listening: {
+              entry: ({ context }) =>
+              context.ssRef.send({
+                type: "LISTEN",
+                value: { nlu: true },
+              }),
+    
+              on: {
+                RECOGNISED:
+                [ 
+                  {guard: and(["createMeeting", "asrConfidence", "nluConfidence"]),
+                  target: "#DM.System.InitialiseAppointment",
+                  actions: assign({reprompts: ({ }) => 0}),
+                },
+                {
+                  guard: "createMeeting", 
+                  target: "Confirmation",
+                  actions: [
+                    assign({
+                    confirmationNLU: ({ event }) => event.nluValue}),
+                  /*assign({
+                    confirmationASR: ({ event }) => event.value[0]
+                  }),*/],},
+                  {guard: "noEntities", target: "#DM.TryAgainUnderstanding"},
+                  { 
+                    guard: and(["whoIsX", "asrConfidence", "nluConfidence", "inFamous"]),
+                    target: "#DM.Final",                
+                    actions:
+                    ({ context, event }) =>
+                    context.ssRef.send({
+                      type: "SPEAK",
+                      value: {
+                        utterance: `${famousPeopleDescriptions[event.nluValue.entities[0].text]}`,
+                      },
+                    }),
+                  },
+                {
+                  guard: and(["whoIsX", "inFamous"]),
+                  target: "Confirmation",
+                  actions: [
+                    assign({
+                    confirmationNLU: ({ event }) => event.nluValue
+                  }),
+                  assign({
+                    confirmationASR: ({ event }) => event.value[0]
+                  }),],},
+    
+               ],
+                },
               },
-              {
-                guard: ({ event }) => (event.nluValue.entities.length > 0 && event.nluValue.entities[0].category === "negative"),
-                target: "#DM.InitialiseAppointment",
-                actions: {
-                  type: "speak",
-                  params: `All right! Let's try again.`
-                }
-              },       
-            ],
+           
+              
+            Confirmation: {
+              //This confirmation state is a bit messier than the rest since there is more disambiguation required in DecideIntent
+              //than elsewhere
+              initial: "Confirming",
+              states: {
+              Confirming: {
+                always: [
+                  { guard: ({ context }) => context.confirmationNLU.topIntent === "who is X",
+                        actions:
+                        ({ context }) => context.ssRef.send({
+                          type: "SPEAK",
+                          value: {
+                            utterance: `Do you want to know who ${context.confirmationNLU.entities[0].text} is?`,
+                          },}),},
+                      { guard: ({ context }) => context.confirmationNLU.topIntent === "create a meeting",
+                        actions: 
+                        ({ context }) => context.ssRef.send({
+                          type: "SPEAK",
+                          value: {
+                            utterance: `Do you want to book a meeting?`,
+                          },}),},],
+                    on: { SPEAK_COMPLETE: "Resolving" },},
+                    
+    
+          Resolving: {
+            entry:
+              ({ context }) =>
+            context.ssRef.send({
+              type: "LISTEN",
+              value: { nlu: true },
+            }),
+    
+            on: {
+              RECOGNISED: 
+              [ {guard: "noEntities", target: "#DM.TryAgainUnderstanding"},
+                { guard: and(["confWhoIsX", "yes"]),  
+                  target: "#DM.Final",
+                  actions:[
+                    ({ context }) =>
+                    context.ssRef.send({
+                      type: "SPEAK",
+                      value: {
+                        utterance: `${famousPeopleDescriptions[context.confirmationNLU.entities[0].text]}`,
+                      },}),],},
+                {
+                  guard: and(["confCreateMeeting", "yes"]),
+                  target: "#DM.System.InitialiseAppointment",
+                  actions: 
+                  assign({reprompts: ({ }) => 0}),
+                },
+                //I just go straight back to the initial prompt if the confirmation is not affirmed, regardless of whether this is due
+                //negative confirmation or some irrelevant entity being the top entity, and regardless of the confidence of the confirmation.
+                //Trying to confirm a confirmation and similar practices just seems more frustrating from a user perspective, so it seems
+                //reasonable to just make a call if the confirmation is not successful.
+                {target: "#DM.System.DecideIntent",}
+              ],
             },
           },
         },
-      },    
+      },
+    },
+    },
+      
+        InitialiseAppointment: {
+          entry: {        
+              type: "speak",
+              params: `Let's book an appointment!`
+            },
+            on: {
+              SPEAK_COMPLETE: "MeetWho",
+            },
+        },
+    
+        MeetWho: {
+          initial: "Prompting",
+          states: {
+            Prompting:{
+              entry: {        
+                type: "speak",
+                params: `Who are you meeting with?`
+            },
+              on:{
+                SPEAK_COMPLETE: "Listening"
+                },
+            },
+            Listening: {
+              entry: ({ context }) =>
+              context.ssRef.send({
+                type: "LISTEN",
+                value: { nlu: true },
+              }),
+              on: {
+                RECOGNISED: [
+                  {guard: "noEntities", target: "#DM.TryAgainUnderstanding"},
+                  {
+                    guard: and(["nameEnt", "nluEntConf", "asrConfidence"]),
+                    target: "#DM.System.WhichDay",
+                    actions: [assign({
+                      person: ({ event }) => event.nluValue.entities[0].text,
+                    }),
+                    assign({reprompts: ({ }) => 0}),],
+                  },
+                  {
+                    guard: "nameEnt",
+                    target: "Confirmation",
+                    actions: [
+                      assign({
+                      confirmationNLU: ({ event }) => event.nluValue
+                    }),
+                    assign({
+                      confirmationASR: ({ event }) => event.value[0]
+                    }),],},
+                ],
+                },
+              },
+            Confirmation: {
+              initial: "Confirming",
+              states: {
+                Confirming: {
+                  always:              
+                  {actions: 
+                  ({ context }) => context.ssRef.send({
+                    type: "SPEAK",
+                    value: {
+                      utterance: `${confirmationSpecifier(context.confirmationNLU, context.confirmationASR,
+                        `do you want to meet with`)}`,
+                    },
+                  }),
+                
+                },
+              
+              on: { SPEAK_COMPLETE: "Resolving" },
+            },
+    
+            Resolving: {
+              entry: 
+                ({ context }) =>
+              context.ssRef.send({
+                type: "LISTEN",
+                value: { nlu: true },
+              }),
+              on: {
+                RECOGNISED: 
+                [{guard: "noEntities", target: "#DM.TryAgainUnderstanding"},
+                  { 
+                    guard:  "yes",
+                    target: "#DM.System.WhichDay",
+                    actions: [assign({
+                      person: ({ context }) => context.confirmationNLU.entities[0].text,
+                    }),
+                    assign({reprompts: ({ }) => 0}),],       
+                  },
+                  {target: "#DM.System.MeetWho"}
+                ],
+              },
+            },
+          },
+        },
+    
+      },
+    },
+    
+        WhichDay: {
+          initial: "Prompting",
+          states: {
+            Prompting:{
+              entry: {        
+                type: "speak",
+                params: `On which day is your meeting?`
+            },
+              on:{
+                SPEAK_COMPLETE: "Listening"
+                },
+            },
+            Listening: {
+              entry: ({ context }) =>
+              context.ssRef.send({
+                type: "LISTEN",
+                value: { nlu: true },
+              }),
+    
+              on: {
+                RECOGNISED: [
+                  {guard: "noEntities", target: "#DM.TryAgainUnderstanding"},
+                  {
+                    guard: and(["DayTimeEnt", "nluEntConf", "asrConfidence"]),
+                    target: "#DM.System.WholeDay",
+                    actions: [assign({
+                      day: ({ event }) => event.nluValue.entities[0].text,
+                    }),
+                    assign({reprompts: ({ }) => 0}),],
+                  },
+                  {
+                    guard: "DayTimeEnt",
+                    target: "Confirmation",
+                    actions: [
+                      assign({
+                      confirmationNLU: ({ event }) => event.nluValue
+                    }),
+                    assign({
+                      confirmationASR: ({ event }) => event.value[0]
+                    }),],},
+                ],
+                },
+              },
+              Confirmation: {
+                initial: "Confirming",
+                states: {
+                  Confirming: {
+                    always:              
+                    {actions: 
+                    ({ context }) => context.ssRef.send({
+                      type: "SPEAK",
+                      value: {
+                        utterance: `${confirmationSpecifier(context.confirmationNLU, context.confirmationASR,
+                          `will the meeting day be`)}`,
+                      },
+                    }),
+                  },
+                on: { SPEAK_COMPLETE: "Resolving" },
+              },
+              Resolving: {
+                entry: 
+                  ({ context }) =>
+                context.ssRef.send({
+                  type: "LISTEN",
+                  value: { nlu: true },
+                }),
+                on: {
+                  RECOGNISED: 
+                  [{guard: "noEntities", target: "#DM.TryAgainUnderstanding"},
+                    { 
+                      guard: "yes",
+                      target: "#DM.System.WholeDay",
+                      actions: [assign({
+                        day: ({ context }) => context.confirmationNLU.entities[0].text,
+                      }),
+                      assign({reprompts: ({ }) => 0}),],         
+                    },
+                    {target: "#DM.System.WhichDay"}
+                  ],
+                },
+              },
+            },
+          },
+          },
+        },
+    
+        WholeDay: {
+          initial: "Prompting",
+          states: {
+            Prompting:{
+              entry: {        
+                type: "speak",
+                params: `Will it take the whole day?`
+            },
+              on:{
+                SPEAK_COMPLETE: "Listening"
+                },
+            },
+            Listening: {
+              entry: ({ context }) =>
+              context.ssRef.send({
+                type: "LISTEN",
+                value: { nlu: true },
+              }),
+    
+              on: {
+                RECOGNISED: [
+                  //I skip confirmation here and just send the user back to the beginning of the state if the newly added confidence threshhold 
+                  //is not met. This is because the confirmation would just be another yes/no question, which this state already is. If the
+                  //object is clarity, restating the question should make the user speak more clearly, and "Will it take the whole day?" should
+                  // not be more of a strain to answer than "Did you say 'yes', and do you want to confirm that it will take the whole day?" 
+                  //The confirmation seems more suited for nonbinary semantic content.
+                  {guard: "noEntities", target: "#DM.TryAgainUnderstanding"},
+                  {
+                    guard: or([not("nluEntConf"), not("asrConfidence")]),
+                    target: "#DM.System.WholeDay",
+                  },
+                  {
+                    guard: "yes",
+                    target: "#DM.System.AppointmentCreation",
+                    actions: 
+                      [assign({
+                      wholeday: "affirmative",
+                    }),
+                    assign({reprompts: ({ }) => 0}),],
+                  },
+                  {
+                    guard: "no",
+                    target: "#DM.System.TimeOfDay",
+                    actions: assign({reprompts: ({ }) => 0}),
+                  },
+                ],
+                },
+              },
+          },
+        },
+        
+        TimeOfDay: {
+          initial: "Prompting",
+          states: {
+            Prompting:{
+              entry: {        
+                type: "speak",
+                params: `What time is your meeting?`
+            },
+              on:{
+                SPEAK_COMPLETE: "Listening"
+                },
+            },
+            Listening: {
+              entry: ({ context }) =>
+              context.ssRef.send({
+                type: "LISTEN",
+                value: { nlu: true },
+              }),
+    
+              on: {
+                RECOGNISED: [
+                  {guard: "noEntities", target: "#DM.TryAgainUnderstanding"},
+                  {
+                    guard: and(["DayTimeEnt", "nluEntConf", "asrConfidence"]),
+                    target: "#DM.System.AppointmentCreation",
+                    actions: [assign({
+                      time: ({ event }) => event.nluValue.entities[0].text,
+                    }),
+                    assign({reprompts: ({ }) => 0}),],
+                  },
+                  {
+                    guard: "DayTimeEnt",
+                    target: "Confirmation",
+                    actions: [
+                      assign({
+                      confirmationNLU: ({ event }) => event.nluValue
+                    }),
+                    assign({
+                      confirmationASR: ({ event }) => event.value[0]
+                    }),],},
+                ],
+                },
+              },
+              Confirmation: {
+                initial: "Confirming",
+                states: {
+                  Confirming: {
+                    always:              
+                    {actions: 
+                    ({ context }) => context.ssRef.send({
+                      type: "SPEAK",
+                      value: {
+                        utterance: `${confirmationSpecifier(context.confirmationNLU, context.confirmationASR,
+                          `will the meeting time be`)}`,
+                      },
+                    }),
+                },
+                on: { SPEAK_COMPLETE: "Resolving" },
+              },
+              Resolving: {
+                entry: 
+                  ({ context }) =>
+                context.ssRef.send({
+                  type: "LISTEN",
+                  value: { nlu: true },
+                }),
+                on: {
+                  RECOGNISED: 
+                  [
+                    {guard: "noEntities", target: "#DM.TryAgainUnderstanding"},
+                    { 
+                      guard: "yes",
+                      target: "#DM.System.AppointmentCreation",
+                      actions: [assign({
+                        time: ({ context }) => context.confirmationNLU.entities[0].text,
+                      }),
+                      assign({reprompts: ({ }) => 0}),],    
+                    },
+                    {target: "#DM.System.TimeOfDay"}
+                  ],
+                },
+              },
+            },
+          },
+        },
+      },
+    
+        AppointmentCreation: {
+          initial: "WholeDayDisambig",  
+          states: {
+            WholeDayDisambig: {
+              always: [{
+                guard: ({ context }) => context.wholeday === "affirmative",
+                target: "PromptingWholeDay",
+              },
+              {target: "PromptingPartialDay"},
+            ],
+            },
+            PromptingWholeDay:{
+              entry: ({ context }) =>
+                context.ssRef.send({
+                  type: "SPEAK",
+                  value: {
+                    utterance: `Do you want me to create an appointment with ${context.person}. ${context.day}
+                    for the whole day?`,
+                  },
+                }),
+              on: { SPEAK_COMPLETE: "Listening" },
+            },
+            PromptingPartialDay: {
+              entry: ({ context }) =>
+                context.ssRef.send({
+                  type: "SPEAK",
+                  value: {
+                    utterance: `Do you want me to create an appointment with ${context.person}. ${context.day}.
+                    ${context.time}?`,
+                  },
+                }),
+              on: { SPEAK_COMPLETE: "Listening" },
+            },
+            Listening: {
+              entry: ({ context }) =>
+              context.ssRef.send({
+                type: "LISTEN",
+                value: { nlu: true },
+              }),
+              on: {
+                RECOGNISED: [
+                  {guard: "noEntities", target: "#DM.TryAgainUnderstanding"},
+                   {
+                    guard:  "yes",
+                    target: "#DM.Final",
+                  actions: {
+                    type: "speak",
+                    params: `Your appointment has been created! Click again to book another one.`
+                  },  
+                  },
+                  {
+                    guard: "no",
+                    target: "#DM.System.InitialiseAppointment",
+                    actions: {
+                      type: "speak",
+                      params: `All right! Let's try again.`
+                    }
+                  },       
+                ],
+                },
+              },
+            },
+          },
+      },
+    },
+
+    
     Final: {
       on: {
-        CLICK: "DecideIntent",
+        CLICK: "System.DecideIntent",
       },
     },
   },
